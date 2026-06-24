@@ -628,6 +628,52 @@ def certificate(content_id):
     })
 
 
+# Stretch feature: Analytics Dashboard.
+#
+# Read-only endpoint that summarizes the audit log into aggregate metrics
+# (submission/appeal totals, detection breakdown, appeal rate, and average
+# scores). It only reads the audit log and never calls the LLM.
+@app.route("/analytics", methods=["GET"])
+def analytics():
+    """Return aggregate detection metrics computed from the audit log."""
+    entries = read_audit_log()
+
+    submissions = [e for e in entries if e.get("event_type") == "submission"]
+    appeals = [e for e in entries if e.get("event_type") == "appeal"]
+
+    total_submissions = len(submissions)
+    total_appeals = len(appeals)
+
+    # Detection breakdown across submissions only.
+    detection_counts = {"likely_ai": 0, "likely_human": 0, "uncertain": 0}
+    for entry in submissions:
+        attribution = entry.get("attribution")
+        if attribution in detection_counts:
+            detection_counts[attribution] += 1
+
+    if total_submissions:
+        appeal_rate = round(total_appeals / total_submissions, 2)
+        average_confidence = round(
+            sum(e.get("confidence", 0) for e in submissions) / total_submissions, 2
+        )
+        average_combined_score = round(
+            sum(e.get("combined_score", 0) for e in submissions) / total_submissions, 2
+        )
+    else:
+        appeal_rate = 0
+        average_confidence = 0
+        average_combined_score = 0
+
+    return jsonify({
+        "total_submissions": total_submissions,
+        "total_appeals": total_appeals,
+        "detection_counts": detection_counts,
+        "appeal_rate": appeal_rate,
+        "average_confidence": average_confidence,
+        "average_combined_score": average_combined_score,
+    })
+
+
 if __name__ == "__main__":
     validate_labels()
     app.run(debug=True, port=5001)
