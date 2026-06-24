@@ -75,7 +75,7 @@ def get_llm_score(text):
 
     raw_content = response.choices[0].message.content
     llm_score, explanation = parse_llm_response(raw_content)
-    return llm_score, explanation
+    return llm_score, normalize_whitespace(explanation)
 
 
 def parse_llm_response(raw_content):
@@ -107,6 +107,19 @@ def parse_llm_response(raw_content):
     score = max(0.0, min(1.0, score))
 
     return score, explanation
+
+
+def normalize_whitespace(text):
+    """Collapse runs of whitespace in the explanation into single spaces.
+
+    One test produced an explanation with a missing/odd space (e.g.
+    "generic  language" rendering as "genericlanguage"-style spacing issues).
+    This tidies the spacing without changing the wording: runs of whitespace
+    become a single space and leading/trailing whitespace is stripped.
+    """
+    if not text:
+        return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -283,8 +296,8 @@ def classify(llm_score, stylometric_score, repetition_score):
 
     Interpreting combined_score as AI-likelihood:
       0.00 - 0.39  -> likely_human
-      0.40 - 0.74  -> uncertain
-      0.75 - 1.00  -> likely_ai
+      0.40 - 0.64  -> uncertain
+      0.65 - 1.00  -> likely_ai
 
     Returns (attribution, confidence, label, combined_score).
     """
@@ -294,7 +307,7 @@ def classify(llm_score, stylometric_score, repetition_score):
         + 0.20 * repetition_score
     )
 
-    if combined_score >= 0.75:
+    if combined_score >= 0.65:
         attribution = "likely_ai"
         confidence = combined_score
     elif combined_score < 0.40:
@@ -302,10 +315,10 @@ def classify(llm_score, stylometric_score, repetition_score):
         confidence = 1 - combined_score
     else:
         attribution = "uncertain"
-        # Keep uncertain confidence moderate: ~0.50 at the middle of the band
-        # and only slightly higher toward the edges, so an uncertain result
-        # never reads as high-confidence AI/human.
-        confidence = clamp(0.50 + abs(combined_score - 0.575))
+        # Keep uncertain confidence moderate: ~0.50 at the middle of the
+        # 0.40 - 0.65 band and only slightly higher toward the edges, so an
+        # uncertain result never reads as high-confidence AI/human.
+        confidence = clamp(0.50 + abs(combined_score - 0.525))
 
     label = LABELS[attribution]
 
