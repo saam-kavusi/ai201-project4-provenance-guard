@@ -15,6 +15,7 @@ final attribution and confidence.
 Endpoints:
   POST /submit  - classify a submitted writing sample
   GET  /log     - return recent structured audit log entries
+  POST /appeal  - let a creator contest a classification
 """
 
 import json
@@ -25,6 +26,8 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from groq import Groq
 
 # ---------------------------------------------------------------------------
@@ -38,6 +41,14 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 AUDIT_LOG_FILE = "audit_log.json"
 
 app = Flask(__name__)
+
+# Rate limiter. We attach limits per-endpoint (see /submit) rather than
+# applying a global default, so /log and /appeal stay unthrottled.
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    storage_uri="memory://",
+)
 
 # Create the Groq client once at startup so we reuse it across requests.
 client = Groq(api_key=GROQ_API_KEY)
@@ -281,12 +292,22 @@ LABELS = {
 def validate_labels():
     """Startup self-check that guards against label-wording regressions.
 
-    Raises AssertionError if any expected substring is missing, which can
-    happen when a label is accidentally split across lines or mangled.
+    Raises AssertionError unless every label matches its canonical wording
+    exactly, character for character. Exact equality (rather than substring
+    checks) catches collapsed spacing such as "strong signs" -> "strongsigns".
     """
-    assert "strong signs that" in LABELS["likely_ai"]
-    assert "likely written by" in LABELS["likely_human"]
-    assert "human-written or AI-generated" in LABELS["uncertain"]
+    assert LABELS["likely_ai"] == (
+        "Provenance Guard found strong signs that this content may have been "
+        "AI-generated."
+    )
+    assert LABELS["likely_human"] == (
+        "Provenance Guard found strong signs that this content was likely "
+        "written by a human."
+    )
+    assert LABELS["uncertain"] == (
+        "Provenance Guard could not confidently determine whether this content "
+        "was human-written or AI-generated."
+    )
 
 
 def classify(llm_score, stylometric_score, repetition_score):
@@ -333,9 +354,18 @@ def classify(llm_score, stylometric_score, repetition_score):
 # ---------------------------------------------------------------------------
 
 def append_audit_entry(entry):
-    """Append a structured entry to the local JSON audit log file."""
+    """Append a structured entry to the local JSON audit log file.
+
+    Guarded by assert_labels_intact() so a corrupted label can never reach
+    the file through the append path (e.g. /submit).
+    """
+    assert_labels_intact([entry])
     entries = read_audit_log()
     entries.append(entry)
+    # Re-validate the FULL list we are about to persist, not just the new
+    # entry. This catches a corrupted label that may already be present in the
+    # existing file (or any other entry) before we write the whole file back.
+    assert_labels_intact(entries)
     with open(AUDIT_LOG_FILE, "w") as f:
         json.dump(entries, f, indent=2)
 
@@ -352,11 +382,72 @@ def read_audit_log():
         return []
 
 
+def update_audit_log(entries):
+    """Overwrite the audit log file with the given list of entries.
+
+    Used when we need to mutate an existing entry in place (e.g. flipping a
+    submission's status to 'under_review' after an appeal).
+
+    Guarded by assert_labels_intact() so a corrupted label can never reach
+    the file through the overwrite path (e.g. /appeal).
+    """
+    assert_labels_intact(entries)
+    with open(AUDIT_LOG_FILE, "w") as f:
+        json.dump(entries, f, indent=2)
+
+
+# Substrings that can only appear when a label's spacing has been mangled
+# (e.g. "strong signs" collapsed to "strongsigns"). A correct label never
+# contains any of these, so we treat their presence as corruption.
+MANGLED_LABEL_MARKERS = ("strongsigns", "writtenby", "human-writtenor")
+
+
+def assert_labels_intact(entries):
+    """Raise unless every entry's label is exactly one of the canonical labels.
+
+    Defensive guard against the class of bug where a label is rebuilt or
+    re-spaced before being persisted (e.g. "a human" collapsed to "ahuman").
+    Validation is exact membership in LABELS.values(): any deviation,
+    character for character, is rejected so we never write a corrupted label
+    to the audit log. MANGLED_LABEL_MARKERS is kept only as an extra
+    diagnostic hint in the error message.
+    """
+    canonical = set(LABELS.values())
+    for entry in entries:
+        if "label" not in entry:
+            continue
+        label = entry["label"]
+        if label in canonical:
+            continue
+        lowered = label.lower() if isinstance(label, str) else ""
+        hit = next((m for m in MANGLED_LABEL_MARKERS if m in lowered), None)
+        marker_hint = f" (matches mangled marker '{hit}')" if hit else ""
+        raise ValueError(
+            "Refusing to write audit log: label is not a canonical value"
+            f"{marker_hint}: {label!r}"
+        )
+
+
+def find_submission_entry(content_id):
+    """Return (index, entry) for the submission with this content_id.
+
+    Only 'submission' entries are matched, so an appeal event sharing the
+    same content_id is never mistaken for the original submission. Returns
+    (None, None) when no matching submission exists.
+    """
+    entries = read_audit_log()
+    for index, entry in enumerate(entries):
+        if entry.get("event_type") == "submission" and entry.get("content_id") == content_id:
+            return index, entry
+    return None, None
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
 @app.route("/submit", methods=["POST"])
+@limiter.limit("10 per minute;100 per day")
 def submit():
     data = request.get_json(silent=True)
     if data is None:
@@ -381,11 +472,17 @@ def submit():
         llm_score, stylometric_score, repetition_score
     )
 
+    # The label must be the exact canonical string for this attribution. We
+    # reuse classify()'s returned label verbatim everywhere below and never
+    # reconstruct or re-space it.
+    assert label == LABELS[attribution]
+
     content_id = str(uuid.uuid4())
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    # Write the audit log entry.
-    append_audit_entry({
+    # Build the audit log entry as a named dict so we can assert on the exact
+    # object we hand to the logger.
+    audit_entry = {
         "event_type": "submission",
         "timestamp": timestamp,
         "content_id": content_id,
@@ -398,7 +495,16 @@ def submit():
         "combined_score": combined_score,
         "status": "classified",
         "label": label,
-    })
+    }
+
+    # Final canonical-label checks immediately before persisting. The label on
+    # the dict we are about to write must match its attribution exactly and be
+    # a member of the canonical label set, character for character.
+    assert audit_entry["label"] == LABELS[attribution]
+    assert audit_entry["label"] in set(LABELS.values())
+
+    # Write the audit log entry.
+    append_audit_entry(audit_entry)
 
     # Build and return the API response.
     return jsonify({
@@ -421,6 +527,74 @@ def submit():
 def log():
     """Return recent audit log entries (most recent last)."""
     return jsonify({"entries": read_audit_log()})
+
+
+@app.route("/appeal", methods=["POST"])
+def appeal():
+    """Let a creator contest the classification of a prior submission.
+
+    Marks the original submission entry as 'under_review', records the
+    appeal on that entry, and appends a separate 'appeal' audit event.
+    """
+    data = request.get_json(silent=True)
+    if data is None:
+        return jsonify({"error": "Request body must be valid JSON."}), 400
+
+    content_id = data.get("content_id")
+    creator_reasoning = data.get("creator_reasoning")
+    creator_id = data.get("creator_id")
+
+    # Validate required fields.
+    if not content_id or not str(content_id).strip():
+        return jsonify({"error": "Field 'content_id' is required."}), 400
+    if not creator_reasoning or not str(creator_reasoning).strip():
+        return jsonify({"error": "Field 'creator_reasoning' is required."}), 400
+
+    # Look up the original submission.
+    index, entry = find_submission_entry(content_id)
+    if entry is None:
+        return jsonify({
+            "error": f"No submission found with content_id '{content_id}'."
+        }), 404
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    appeal_id = str(uuid.uuid4())
+
+    # Update the original submission entry in place.
+    #
+    # We ONLY add/update the appeal-related fields below. The existing "label"
+    # value is preserved exactly as written by /submit: it is never read,
+    # rebuilt, re-spaced, or recomputed here, and classify() is never called
+    # in this route.
+    entries = read_audit_log()
+    entries[index]["status"] = "under_review"
+    entries[index]["appeal_submitted"] = True
+    entries[index]["appeal_reasoning"] = creator_reasoning
+    entries[index]["appeal_timestamp"] = timestamp
+
+    # Append a separate audit event describing the appeal itself.
+    appeal_entry = {
+        "event_type": "appeal",
+        "appeal_id": appeal_id,
+        "content_id": content_id,
+        "creator_reasoning": creator_reasoning,
+        "timestamp": timestamp,
+        "status": "under_review",
+    }
+    if creator_id is not None and str(creator_id).strip():
+        appeal_entry["creator_id"] = creator_id
+    entries.append(appeal_entry)
+
+    # update_audit_log() runs the shared assert_labels_intact() guard before
+    # writing, so corrupted labels can never be persisted here.
+    update_audit_log(entries)
+
+    return jsonify({
+        "appeal_received": True,
+        "content_id": content_id,
+        "status": "under_review",
+        "appeal_id": appeal_id,
+    })
 
 
 if __name__ == "__main__":
