@@ -153,6 +153,20 @@ def clamp(value):
     return max(0.0, min(1.0, value))
 
 
+# Multi-modal stretch support: turn an image_metadata object into a plain-text
+# block so the existing text-based detector can score it unchanged. We simply
+# join each provided field into a readable "Key: value" line.
+def metadata_to_text(metadata):
+    """Flatten an image-metadata dict into readable text lines."""
+    lines = []
+    for key, value in metadata.items():
+        if value is None or str(value).strip() == "":
+            continue
+        readable_key = str(key).replace("_", " ").strip().title()
+        lines.append(f"{readable_key}: {str(value).strip()}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Detection Signal 2: Stylometric heuristics
 # ---------------------------------------------------------------------------
@@ -454,13 +468,32 @@ def submit():
         return jsonify({"error": "Request body must be valid JSON."}), 400
 
     creator_id = data.get("creator_id")
-    text = data.get("text")
 
     # Validate required fields.
     if not creator_id or not str(creator_id).strip():
         return jsonify({"error": "Field 'creator_id' is required."}), 400
-    if not text or not str(text).strip():
-        return jsonify({"error": "Field 'text' is required."}), 400
+
+    # Multi-modal stretch support: /submit accepts an optional content_type so
+    # the same detection pipeline can score plain text or image metadata. Text
+    # submissions behave exactly as before; image_metadata submissions provide
+    # a "metadata" object that we flatten into readable text for the detector.
+    content_type = data.get("content_type", "text")
+
+    if content_type == "text":
+        text = data.get("text")
+        if not text or not str(text).strip():
+            return jsonify({"error": "Field 'text' is required."}), 400
+    elif content_type == "image_metadata":
+        metadata = data.get("metadata")
+        if not isinstance(metadata, dict) or not metadata:
+            return jsonify({
+                "error": "Field 'metadata' is required for image_metadata submissions."
+            }), 400
+        text = metadata_to_text(metadata)
+    else:
+        return jsonify({
+            "error": "Unsupported content_type. Use 'text' or 'image_metadata'."
+        }), 400
 
     # Run all three detection signals.
     llm_score, explanation = get_llm_score(text)
@@ -487,6 +520,7 @@ def submit():
         "timestamp": timestamp,
         "content_id": content_id,
         "creator_id": creator_id,
+        "content_type": content_type,
         "attribution": attribution,
         "confidence": confidence,
         "llm_score": round(llm_score, 2),
@@ -510,6 +544,7 @@ def submit():
     return jsonify({
         "content_id": content_id,
         "creator_id": creator_id,
+        "content_type": content_type,
         "attribution": attribution,
         "confidence": confidence,
         "label": label,
