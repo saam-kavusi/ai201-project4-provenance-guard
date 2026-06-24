@@ -597,6 +597,37 @@ def appeal():
     })
 
 
+# Stretch feature: Provenance Certificate.
+#
+# Read-only endpoint that builds a shareable provenance certificate for a
+# previously classified submission. It only reads the audit log and never
+# calls the LLM or re-runs any detection signal.
+@app.route("/certificate/<content_id>", methods=["GET"])
+def certificate(content_id):
+    """Return a provenance certificate for a classified submission."""
+    _, entry = find_submission_entry(content_id)
+    if entry is None:
+        return jsonify({"error": "No submission found for this content_id."}), 404
+
+    return jsonify({
+        "certificate_id": "cert-" + content_id,
+        "content_id": content_id,
+        "creator_id": entry.get("creator_id"),
+        "attribution": entry.get("attribution"),
+        "confidence": entry.get("confidence"),
+        "label": entry.get("label"),
+        "timestamp": entry.get("timestamp"),
+        "audit_status": entry["status"],
+        "appeal_submitted": entry.get("appeal_submitted", False),
+        "signal_scores": {
+            "llm_score": entry.get("llm_score"),
+            "stylometric_score": entry.get("stylometric_score"),
+            "repetition_score": entry.get("repetition_score"),
+            "combined_score": entry.get("combined_score"),
+        },
+    })
+
+
 if __name__ == "__main__":
     validate_labels()
     app.run(debug=True, port=5001)
