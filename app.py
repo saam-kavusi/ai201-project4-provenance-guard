@@ -1,9 +1,16 @@
 """
-Provenance Guard - Milestone 3
+Provenance Guard - Milestone 4
 
-A Flask backend that accepts submitted text and uses a single detection
-signal (an LLM judgment from Groq) to classify whether the text appears
-AI-generated, human-written, or uncertain.
+A Flask backend that accepts submitted text and uses three detection
+signals to classify whether the text appears AI-generated, human-written,
+or uncertain:
+
+  1. LLM-based classification (Groq llama-3.3-70b-versatile)
+  2. Stylometric heuristics (pure Python writing statistics)
+  3. Repetition / generic-phrase detection (pure Python)
+
+The three signals are blended into a single combined_score that drives the
+final attribution and confidence.
 
 Endpoints:
   POST /submit  - classify a submitted writing sample
@@ -103,36 +110,209 @@ def parse_llm_response(raw_content):
 
 
 # ---------------------------------------------------------------------------
-# Attribution mapping (temporary Milestone 3 rules)
+# Shared text helpers (used by the pure-Python signals)
 # ---------------------------------------------------------------------------
 
-def classify(llm_score):
-    """Map an llm_score to (attribution, confidence, label)."""
-    if llm_score >= 0.75:
+def split_sentences(text):
+    """Split text into sentences on ., !, and ? boundaries."""
+    parts = re.split(r"[.!?]+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def split_words(text):
+    """Return a lowercased list of word tokens (letters and apostrophes)."""
+    return re.findall(r"[a-zA-Z']+", text.lower())
+
+
+def clamp(value):
+    """Keep a number inside the 0.0 - 1.0 range."""
+    return max(0.0, min(1.0, value))
+
+
+# ---------------------------------------------------------------------------
+# Detection Signal 2: Stylometric heuristics
+# ---------------------------------------------------------------------------
+
+def get_stylometric_score(text):
+    """Estimate AI-likelihood from measurable writing statistics.
+
+    Returns a float from 0.0 to 1.0:
+      - Higher  = text looks uniform / formulaic (more AI-like)
+      - Lower   = text looks varied / irregular (more human-like)
+
+    It blends three sub-measurements:
+      - sentence length variance (uniform lengths look AI-like)
+      - type-token ratio / vocabulary diversity (low diversity looks AI-like)
+      - punctuation variety (expressive punctuation looks human-like)
+    """
+    sentences = split_sentences(text)
+    words = split_words(text)
+
+    # Not enough signal to judge; stay neutral.
+    if len(words) < 5 or len(sentences) == 0:
+        return 0.5
+
+    # --- Sub-measurement A: sentence length variance -----------------------
+    # Humans tend to mix short and long sentences. We use the coefficient of
+    # variation (std / mean) so the measure is independent of average length.
+    lengths = [len(split_words(s)) for s in sentences]
+    lengths = [length for length in lengths if length > 0]
+    mean_len = sum(lengths) / len(lengths)
+
+    if len(lengths) > 1 and mean_len > 0:
+        variance = sum((length - mean_len) ** 2 for length in lengths) / len(lengths)
+        std_dev = variance ** 0.5
+        coeff_variation = std_dev / mean_len
+    else:
+        coeff_variation = 0.0
+
+    # A CV of ~0.6+ is quite varied (human); ~0 is perfectly uniform (AI).
+    uniformity_score = clamp(1.0 - (coeff_variation / 0.6))
+
+    # --- Sub-measurement B: vocabulary diversity (type-token ratio) --------
+    type_token_ratio = len(set(words)) / len(words)
+    # TTR >= 0.7 is diverse (human); TTR <= 0.4 is repetitive (AI).
+    low_diversity_score = clamp((0.7 - type_token_ratio) / 0.3)
+
+    # --- Sub-measurement C: punctuation variety ----------------------------
+    # Humans reach for a wider range of marks (; : ! ? ( ) - —).
+    expressive_marks = set(re.findall(r"[;:!?()\-—]", text))
+    punctuation_score = clamp(1.0 - (len(expressive_marks) / 4.0))
+
+    # Weighted blend; sentence variance and diversity carry the most weight.
+    stylometric_score = (
+        0.45 * uniformity_score
+        + 0.40 * low_diversity_score
+        + 0.15 * punctuation_score
+    )
+    return round(clamp(stylometric_score), 2)
+
+
+# ---------------------------------------------------------------------------
+# Detection Signal 3: Repetition and generic phrases
+# ---------------------------------------------------------------------------
+
+# Common AI-style filler / transition phrases.
+GENERIC_PHRASES = [
+    "it is important to note",
+    "furthermore",
+    "moreover",
+    "in conclusion",
+    "plays a crucial role",
+    "rapidly evolving",
+    "transformative",
+    "in today's world",
+    "a testament to",
+    "delve into",
+]
+
+
+def get_repetition_score(text):
+    """Estimate AI-likelihood from repeated / formulaic language.
+
+    Returns a float from 0.0 to 1.0:
+      - Higher = more repeated phrases and stock transitions (more AI-like)
+      - Lower  = less formulaic (more human-like)
+
+    It blends three sub-measurements:
+      - hits against a list of generic AI-style phrases
+      - repeated sentence openings (same first word reused)
+      - repeated three-word phrases (trigrams)
+    """
+    lowered = text.lower()
+    words = split_words(text)
+    sentences = split_sentences(text)
+
+    # --- Sub-measurement A: generic phrase hits ----------------------------
+    phrase_hits = sum(1 for phrase in GENERIC_PHRASES if phrase in lowered)
+    # Three or more stock phrases is a strong tell.
+    phrase_component = clamp(phrase_hits / 3.0)
+
+    # --- Sub-measurement B: repeated sentence openings ---------------------
+    openings = [split_words(s)[0] for s in sentences if split_words(s)]
+    if openings:
+        repeated_openings = len(openings) - len(set(openings))
+        opening_component = clamp(repeated_openings / len(openings))
+    else:
+        opening_component = 0.0
+
+    # --- Sub-measurement C: repeated three-word phrases --------------------
+    trigrams = [tuple(words[i:i + 3]) for i in range(len(words) - 2)]
+    if trigrams:
+        repeated_trigrams = len(trigrams) - len(set(trigrams))
+        ngram_component = clamp(repeated_trigrams / len(trigrams))
+    else:
+        ngram_component = 0.0
+
+    repetition_score = (
+        0.50 * phrase_component
+        + 0.30 * opening_component
+        + 0.20 * ngram_component
+    )
+    return round(clamp(repetition_score), 2)
+
+
+# ---------------------------------------------------------------------------
+# Ensemble: blend the three signals into an attribution + confidence
+# ---------------------------------------------------------------------------
+
+# Human-readable label for each attribution. Each value is a single, complete
+# string so the wording is identical in the API response and the audit log.
+LABELS = {
+    "likely_ai": "Provenance Guard found strong signs that this content may have been AI-generated.",
+    "likely_human": "Provenance Guard found strong signs that this content was likely written by a human.",
+    "uncertain": "Provenance Guard could not confidently determine whether this content was human-written or AI-generated.",
+}
+
+
+def validate_labels():
+    """Startup self-check that guards against label-wording regressions.
+
+    Raises AssertionError if any expected substring is missing, which can
+    happen when a label is accidentally split across lines or mangled.
+    """
+    assert "strong signs that" in LABELS["likely_ai"]
+    assert "likely written by" in LABELS["likely_human"]
+    assert "human-written or AI-generated" in LABELS["uncertain"]
+
+
+def classify(llm_score, stylometric_score, repetition_score):
+    """Blend the three signals and map the result to a final verdict.
+
+    combined_score = 0.50*llm + 0.30*stylometric + 0.20*repetition
+
+    Interpreting combined_score as AI-likelihood:
+      0.00 - 0.39  -> likely_human
+      0.40 - 0.74  -> uncertain
+      0.75 - 1.00  -> likely_ai
+
+    Returns (attribution, confidence, label, combined_score).
+    """
+    combined_score = (
+        0.50 * llm_score
+        + 0.30 * stylometric_score
+        + 0.20 * repetition_score
+    )
+
+    if combined_score >= 0.75:
         attribution = "likely_ai"
-        confidence = llm_score
-        label = (
-            "Provenance Guard found strong signs that this content may have "
-            "been AI-generated."
-        )
-    elif llm_score <= 0.39:
+        confidence = combined_score
+    elif combined_score < 0.40:
         attribution = "likely_human"
-        confidence = 1 - llm_score
-        label = (
-            "Provenance Guard found strong signs that this content was likely "
-            "written by a human."
-        )
+        confidence = 1 - combined_score
     else:
         attribution = "uncertain"
-        confidence = 0.5
-        label = (
-            "Provenance Guard could not confidently determine whether this "
-            "content was human-written or AI-generated."
-        )
+        # Keep uncertain confidence moderate: ~0.50 at the middle of the band
+        # and only slightly higher toward the edges, so an uncertain result
+        # never reads as high-confidence AI/human.
+        confidence = clamp(0.50 + abs(combined_score - 0.575))
+
+    label = LABELS[attribution]
 
     # Round for clean output.
     confidence = round(confidence, 2)
-    return attribution, confidence, label
+    combined_score = round(combined_score, 2)
+    return attribution, confidence, label, combined_score
 
 
 # ---------------------------------------------------------------------------
@@ -178,11 +358,15 @@ def submit():
     if not text or not str(text).strip():
         return jsonify({"error": "Field 'text' is required."}), 400
 
-    # Run detection signal 1.
+    # Run all three detection signals.
     llm_score, explanation = get_llm_score(text)
+    stylometric_score = get_stylometric_score(text)
+    repetition_score = get_repetition_score(text)
 
-    # Map to attribution / confidence / label.
-    attribution, confidence, label = classify(llm_score)
+    # Blend the signals into the final verdict.
+    attribution, confidence, label, combined_score = classify(
+        llm_score, stylometric_score, repetition_score
+    )
 
     content_id = str(uuid.uuid4())
     timestamp = datetime.now(timezone.utc).isoformat()
@@ -196,6 +380,9 @@ def submit():
         "attribution": attribution,
         "confidence": confidence,
         "llm_score": round(llm_score, 2),
+        "stylometric_score": stylometric_score,
+        "repetition_score": repetition_score,
+        "combined_score": combined_score,
         "status": "classified",
         "label": label,
     })
@@ -209,6 +396,8 @@ def submit():
         "label": label,
         "signals": {
             "llm_score": round(llm_score, 2),
+            "stylometric_score": stylometric_score,
+            "repetition_score": repetition_score,
             "explanation": explanation,
         },
         "status": "classified",
@@ -222,4 +411,5 @@ def log():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    validate_labels()
+    app.run(debug=True, port=5001)
